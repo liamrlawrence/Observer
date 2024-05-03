@@ -1,0 +1,18 @@
+{
+  "refresh_rate": 500,
+  "watchers": [
+    {
+      "extensions": [".go", ".templ"],
+      "include_dirs": ["."],
+      "ignore_patterns": ["_templ\\.go"],
+      "build_command": "make go",
+      "run_command": "./build/main"
+    },
+    {
+      "extensions": [".ts"],
+      "include_dirs": ["static"],
+      "build_command": "make ts"
+    }
+  ]
+}
+
