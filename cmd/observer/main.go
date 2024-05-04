@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -11,8 +12,8 @@ import (
 )
 
 type Config struct {
-	RefreshRate time.Duration   `json:"refresh_rate,omitempty"`
-	Watchers    []WatcherConfig `json:"watchers"`
+	RebuildDelay time.Duration   `json:"rebuild_delay,omitempty"`
+	Watchers     []WatcherConfig `json:"watchers"`
 }
 
 type WatcherConfig struct {
@@ -36,8 +37,8 @@ func main() {
 	}
 
 	// Default values for optional top-level configuration parameters
-	if config.RefreshRate == 0 {
-		config.RefreshRate = time.Duration(500)
+	if config.RebuildDelay == 0 || config.RebuildDelay < 500 {
+		config.RebuildDelay = time.Duration(500)
 	}
 
 	for _, watcherConfig := range config.Watchers {
@@ -55,7 +56,7 @@ func main() {
 			watcherConfig.IgnorePatterns = []string{}
 		}
 
-		w := watcher.NewWatcher(
+		w, err := watcher.NewWatcher(
 			watcherConfig.Extensions,
 			watcherConfig.IncludeDirs,
 			watcherConfig.IgnoreDirs,
@@ -63,7 +64,11 @@ func main() {
 			watcherConfig.IgnorePatterns,
 			watcherConfig.BuildCommand,
 			watcherConfig.RunCommand,
-			config.RefreshRate)
+			config.RebuildDelay)
+		if err != nil {
+			log.Printf("Error initializing watcher: %v\n", err)
+			os.Exit(1)
+		}
 		go w.Start()
 	}
 

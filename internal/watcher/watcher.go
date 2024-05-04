@@ -6,24 +6,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
-type FileData struct {
-	Path    string
-	ModTime time.Time
-}
-
 type Watcher struct {
+	watcher         *fsnotify.Watcher
 	Extensions      []string
-	IncludeDirs     []string
-	IgnoreDirs      []string
 	IncludePatterns []*regexp.Regexp
 	IgnorePatterns  []*regexp.Regexp
+	IncludeDirs     []string
+	IgnoreDirs      []string
 	BuildCommand    string
 	RunCommand      *string
-	RefreshRate     time.Duration
-	FileData        map[string]*FileData
+	RebuildDelay    time.Duration
 	ChangeDetected  bool
 
 	runCmd *exec.Cmd
@@ -38,39 +36,41 @@ func compilePatterns(patterns []string) []*regexp.Regexp {
 	return compiledPatterns
 }
 
-func NewWatcher(extensions []string, includeDirs []string, ignoreDirs []string, includePatterns []string, ignorePatterns []string, buildCommand string, runCommand *string, refreshRate time.Duration) *Watcher {
-	compiledIncludePatterns := compilePatterns(includePatterns)
-	compiledIgnorePatterns := compilePatterns(ignorePatterns)
-	return &Watcher{
+func NewWatcher(extensions []string, includeDirs []string, ignoreDirs []string, includePatterns []string, ignorePatterns []string, buildCommand string, runCommand *string, rebuildDelay time.Duration) (*Watcher, error) {
+	fsWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	w := &Watcher{
+		watcher:         fsWatcher,
 		Extensions:      extensions,
 		IncludeDirs:     includeDirs,
 		IgnoreDirs:      ignoreDirs,
-		IncludePatterns: compiledIncludePatterns,
-		IgnorePatterns:  compiledIgnorePatterns,
+		IncludePatterns: compilePatterns(includePatterns),
+		IgnorePatterns:  compilePatterns(ignorePatterns),
 		BuildCommand:    buildCommand,
 		RunCommand:      runCommand,
-		RefreshRate:     refreshRate,
-		FileData:        make(map[string]*FileData),
-		ChangeDetected:  false,
-		stop:            make(chan struct{}),
+		RebuildDelay:    rebuildDelay,
 	}
+
+	for _, dir := range w.IncludeDirs {
+		if err := w.addDirectoryRecursively(dir); err != nil {
+			return nil, err
+		}
+	}
+
+	w.processFileChange()
+
+	return w, nil
 }
 
-func (w *Watcher) visitFile(path string, info os.FileInfo, err error) error {
-	if err != nil {
-		log.Printf("Error accessing path %s: %v\n", path, err)
-		os.Exit(1)
-	}
-
+func (w *Watcher) addDirectoryRecursively(path string) error {
 	// Check if the directory should be ignored
-	if info.IsDir() {
-		dirName := filepath.Base(path)
-		for _, ignoreDir := range w.IgnoreDirs {
-			if dirName == ignoreDir {
-				return filepath.SkipDir
-			}
+	for _, ignoreDir := range w.IgnoreDirs {
+		if ignoreDir == path {
+			return nil
 		}
-		return nil
 	}
 
 	// Check if the path matches any ignore patterns
@@ -80,41 +80,57 @@ func (w *Watcher) visitFile(path string, info os.FileInfo, err error) error {
 		}
 	}
 
-	// Check if the file matches any extensions
-	matchesExtension := false
-	ext := filepath.Ext(path)
-	for _, e := range w.Extensions {
-		if ext == e {
-			matchesExtension = true
-			break
-		}
+	// Add path, and recursively check subdirectories
+	if err := w.watcher.Add(path); err != nil {
+		return err
 	}
 
-	// Check if the path matches any include patterns
-	matchesIncludePattern := false
-	for _, pattern := range w.IncludePatterns {
-		if pattern.MatchString(path) {
-			matchesIncludePattern = true
-			break
-		}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
 	}
 
-	if matchesExtension || matchesIncludePattern {
-		fileData, found := w.FileData[path]
-		if !found {
-			w.FileData[path] = &FileData{
-				Path:    path,
-				ModTime: info.ModTime(),
+	for _, entry := range entries {
+		fullPath := filepath.Join(path, entry.Name())
+		if entry.IsDir() {
+			if err := w.addDirectoryRecursively(fullPath); err != nil {
+				return err
 			}
-			log.Printf("Found new file: %s\n", path)
-			w.ChangeDetected = true
-		} else if fileData.ModTime != info.ModTime() {
-			fileData.ModTime = info.ModTime()
-			log.Printf("File changed: %s\n", path)
-			w.ChangeDetected = true
 		}
 	}
 	return nil
+}
+
+func (w *Watcher) isValidFile(path string) bool {
+	// Ignore directories
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+
+	// Check if the path matches any ignore patterns
+	for _, pattern := range w.IgnorePatterns {
+		if pattern.MatchString(path) {
+			return false
+		}
+	}
+
+	// Check if the file matches any extensions
+	ext := filepath.Ext(path)
+	for _, e := range w.Extensions {
+		if ext == e {
+			return true
+		}
+	}
+
+	// Check if the file matches any include patterns
+	for _, pattern := range w.IncludePatterns {
+		if pattern.MatchString(path) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (w *Watcher) executeBuildCommand(command string) error {
@@ -136,52 +152,60 @@ func (w *Watcher) executeRunCommand(command string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func (w *Watcher) Start() {
-	ticker := time.NewTicker(w.RefreshRate * time.Millisecond)
-	defer ticker.Stop()
+func (w *Watcher) processFileChange() {
+	if err := w.executeBuildCommand(w.BuildCommand); err != nil {
+		log.Printf("Build command failed: %v\n", err)
+	}
 
+	if w.RunCommand != nil {
+		if w.runCmd != nil {
+			_ = w.runCmd.Process.Kill()
+		}
+		runCmd, err := w.executeRunCommand(*w.RunCommand)
+		if err != nil {
+			log.Printf("Error executing run command: %v\n", err)
+			os.Exit(1)
+		}
+		w.runCmd = runCmd
+	}
+}
+
+func debounce(interval time.Duration, fn func()) func() {
+	var (
+		timer *time.Timer
+		mutex sync.Mutex
+	)
+	return func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(interval, fn)
+	}
+}
+
+func (w *Watcher) Start() {
+	debouncedRebuild := debounce(w.RebuildDelay*time.Millisecond, w.processFileChange)
+	defer w.watcher.Close()
 	for {
 		select {
-		case <-w.stop:
-			if w.runCmd != nil {
-				_ = w.runCmd.Process.Kill()
+		case event, ok := <-w.watcher.Events:
+			if !ok {
+				return
 			}
-			return
-
-		case <-ticker.C:
-			for _, dir := range w.IncludeDirs {
-				err := filepath.Walk(dir, w.visitFile)
-				if err != nil {
-					log.Printf("Error walking the path %s: %v\n", dir, err)
+			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				if w.isValidFile(event.Name) {
+					debouncedRebuild()
 				}
 			}
-
-			// Check for deleted files
-			for path := range w.FileData {
-				if _, err := os.Stat(path); os.IsNotExist(err) {
-					delete(w.FileData, path)
-					log.Printf("File deleted: %s\n", path)
-					w.ChangeDetected = true
-				}
+		case err, ok := <-w.watcher.Errors:
+			if !ok {
+				return
 			}
-
-			if w.ChangeDetected {
-				w.executeBuildCommand(w.BuildCommand)
-
-				if w.RunCommand != nil {
-					if w.runCmd != nil {
-						_ = w.runCmd.Process.Kill()
-					}
-					runCmd, err := w.executeRunCommand(*w.RunCommand)
-					if err != nil {
-						log.Printf("Error executing run command: %v\n", err)
-						continue
-					}
-					w.runCmd = runCmd
-				}
-
-				w.ChangeDetected = false
-			}
+			log.Printf("Watcher error: %v\n", err)
+			os.Exit(1)
 		}
 	}
 }

@@ -19,7 +19,7 @@ go install github.com/liamrlawrence/observer/cmd/observer@latest
 The Observer tool uses a JSON configuration file to define how it should monitor and respond to file changes in directories. Below is a detailed description of each configuration parameter available in `observer.config.json`.
 
 ### Top-Level Configuration
--   **`refresh_rate`** _(optional)_: The refresh rate (in milliseconds) defines how frequently the tool checks for file changes. This value impacts how quickly changes are detected and processed. The default value is 500ms.
+-   **`rebuild_delay`** _(optional)_: The delay (in milliseconds) after a file is changed before rebuilding. If omitted, the default is 500ms.
 
 ### Watchers Configuration
 The `watchers` array contains configurations for different sets of files to watch. Each watcher can be customized with its own set of rules and commands.
