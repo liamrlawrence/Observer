@@ -1,7 +1,11 @@
 {
   "rebuild_delay": 500,
+  "init_commands": [
+    "cp -r node_modules_cache/* node_modules/"
+  ],
   "watchers": [
     {
+      "label": "[Go]",
       "extensions": [".go", ".templ"],
       "include_dirs": ["."],
       "ignore_patterns": ["_templ\\.go"],
@@ -9,6 +13,8 @@
       "run_command": "./build/main"
     },
     {
+      "debug": false,
+      "label": "[TypeScript]",
       "extensions": [".ts"],
       "include_dirs": ["static"],
       "build_command": "make ts"

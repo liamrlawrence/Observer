@@ -1,19 +1,24 @@
 package watcher
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 type Watcher struct {
-	watcher         *fsnotify.Watcher
+	watcher *fsnotify.Watcher
+
+	Label           string
 	Extensions      []string
 	IncludePatterns []*regexp.Regexp
 	IgnorePatterns  []*regexp.Regexp
@@ -26,6 +31,7 @@ type Watcher struct {
 
 	runCmd *exec.Cmd
 	stop   chan struct{}
+	debug  bool
 }
 
 func compilePatterns(patterns []string) []*regexp.Regexp {
@@ -36,7 +42,84 @@ func compilePatterns(patterns []string) []*regexp.Regexp {
 	return compiledPatterns
 }
 
-func NewWatcher(extensions []string, includeDirs []string, ignoreDirs []string, includePatterns []string, ignorePatterns []string, buildCommand string, runCommand *string, rebuildDelay time.Duration) (*Watcher, error) {
+func NewWatcher(label string, extensions []string, includeDirs []string, ignoreDirs []string, includePatterns []string, ignorePatterns []string, buildCommand string, runCommand *string, rebuildDelay time.Duration, debug bool) (*Watcher, error) {
+	// Minimum rebuild delay is 500ms
+	if rebuildDelay < 500 {
+		rebuildDelay = time.Duration(500)
+	}
+
+	// Default values for optional parameters
+	if label == "" {
+		addedField := false
+		separator := ", "
+		var sb strings.Builder
+		sb.WriteString("[")
+		if extensions != nil {
+			// if addedField {
+			// 	sb.WriteString(separator)
+			// }
+			fmt.Fprintf(&sb, "E:%v", extensions)
+			addedField = true
+		}
+		if includeDirs != nil {
+			if addedField {
+				sb.WriteString(separator)
+			}
+			fmt.Fprintf(&sb, "D:%v", includeDirs)
+			addedField = true
+		}
+		if includePatterns != nil {
+			if addedField {
+				sb.WriteString(separator)
+			}
+			fmt.Fprintf(&sb, "P:%v", includePatterns)
+			// addedField = true
+		}
+		sb.WriteString("]")
+		label = sb.String()
+	}
+	if includeDirs == nil {
+		includeDirs = []string{"."}
+	}
+	if ignoreDirs == nil {
+		ignoreDirs = []string{}
+	}
+	if includePatterns == nil {
+		includePatterns = []string{}
+	}
+	if ignorePatterns == nil {
+		ignorePatterns = []string{}
+	}
+
+	if debug {
+		var printRunCmd string
+		if runCommand == nil {
+			printRunCmd = ""
+		} else {
+			printRunCmd = *runCommand
+		}
+		log.Printf(`Creating watcher
+	Label: %v
+
+	Include:
+	- Extensions  %v
+	- Dirs        %v
+	- Patterns    %v
+
+	Ignore:
+	- Dirs        %v
+	- Patterns    %v
+
+	Commands:
+	- Build       [%v]
+	- Run         [%v]
+	`,
+			label,
+			extensions, includeDirs, includePatterns,
+			ignoreDirs, ignorePatterns,
+			buildCommand, printRunCmd)
+	}
+
 	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -44,6 +127,7 @@ func NewWatcher(extensions []string, includeDirs []string, ignoreDirs []string, 
 
 	w := &Watcher{
 		watcher:         fsWatcher,
+		Label:           label,
 		Extensions:      extensions,
 		IncludeDirs:     includeDirs,
 		IgnoreDirs:      ignoreDirs,
@@ -52,6 +136,7 @@ func NewWatcher(extensions []string, includeDirs []string, ignoreDirs []string, 
 		BuildCommand:    buildCommand,
 		RunCommand:      runCommand,
 		RebuildDelay:    rebuildDelay,
+		debug:           debug,
 	}
 
 	for _, dir := range w.IncludeDirs {
@@ -134,39 +219,63 @@ func (w *Watcher) isValidFile(path string) bool {
 }
 
 func (w *Watcher) executeBuildCommand(command string) error {
+	if w.debug {
+		log.Printf("%v - BUILD: %v", w.Label, command)
+	}
 	cmd := exec.Command("bash", "-c", command)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func (w *Watcher) executeRunCommand(command string) (*exec.Cmd, error) {
+func (w *Watcher) executeRunCommand(command string) error {
+	if w.debug {
+		log.Printf("%v - RUN: %v", w.Label, command)
+	}
 	cmd := exec.Command("bash", "-c", command)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Start()
+	w.runCmd = cmd
+
+	err := w.runCmd.Start()
 	if err != nil {
-		log.Printf("Failed to start command: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	return cmd, nil
+
+	go func() {
+		err := w.runCmd.Wait()
+		if err != nil {
+			exitError, ok := err.(*exec.ExitError)
+			if w.debug && ok && exitError.ProcessState.Sys().(syscall.WaitStatus).Signal() == syscall.SIGKILL {
+				log.Printf("%v - KILLED: %v", w.Label, command)
+				return
+			} else {
+				log.Printf("%v - Run command failed: %v", w.Label, err)
+				os.Exit(1)
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (w *Watcher) processFileChange() {
 	if err := w.executeBuildCommand(w.BuildCommand); err != nil {
-		log.Printf("Build command failed: %v\n", err)
+		log.Printf("%v - Build command failed: %v", w.Label, err)
 	}
-
 	if w.RunCommand != nil {
 		if w.runCmd != nil {
-			_ = w.runCmd.Process.Kill()
+			if w.runCmd.ProcessState == nil || !w.runCmd.ProcessState.Exited() {
+				if err := w.runCmd.Process.Kill(); err != nil {
+					log.Printf("%v - Error killing previous run command: %v", w.Label, err)
+					os.Exit(1)
+				}
+			}
+			w.runCmd = nil
 		}
-		runCmd, err := w.executeRunCommand(*w.RunCommand)
-		if err != nil {
-			log.Printf("Error executing run command: %v\n", err)
-			os.Exit(1)
+		if err := w.executeRunCommand(*w.RunCommand); err != nil {
+			log.Printf("%v - Run command failed to start: %v", w.Label, err)
 		}
-		w.runCmd = runCmd
 	}
 }
 
@@ -204,7 +313,7 @@ func (w *Watcher) Start() {
 			if !ok {
 				return
 			}
-			log.Printf("Watcher error: %v\n", err)
+			log.Printf("Watcher error: %v", err)
 			os.Exit(1)
 		}
 	}
